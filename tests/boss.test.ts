@@ -1,0 +1,91 @@
+import { describe, expect, it } from 'vitest';
+import { InvItem } from '../src/game/inventory';
+import { ITEM_SPAWNS, ItemKind } from '../src/game/map';
+import { SMG } from '../src/game/weapons';
+import { CRATE_BULLETS } from '../src/game/items';
+import { MAX_HP, World } from '../src/game/world';
+import { BOSS, ZState, Zombie } from '../src/game/zombie';
+
+const idle = { forward: 0, strafe: 0, turn: 0 };
+
+describe('boss arena', () => {
+  it('the arena has an SMG and plenty of ammo to kill the boss', () => {
+    const arena = ITEM_SPAWNS.filter((i) => i.y >= 20);
+    expect(arena.some((i) => i.kind === ItemKind.Smg)).toBe(true);
+    const bullets = arena.filter((i) => i.kind === ItemKind.BulletCrate).length * CRATE_BULLETS + SMG.magSize;
+    const needed = BOSS.hp / SMG.damage;
+    expect(bullets).toBeGreaterThan(needed * 2);
+  });
+
+  it('the boss barely staggers or gets pushed by shots', () => {
+    const b = new Zombie(BOSS, 5, 5);
+    b.hurt(9, SMG.stagger, 1, 0, SMG.knock);
+    expect(b.stagger).toBeLessThan(0.02);
+    expect(b.state).toBe(ZState.Chase);
+  });
+
+  it('the boss can be outwalked, even enraged', async () => {
+    const { MOVE_SPEED } = await import('../src/game/player');
+    expect(BOSS.speed).toBeLessThan(MOVE_SPEED * 0.7);
+    expect(BOSS.speed * 1.45).toBeLessThan(MOVE_SPEED);
+  });
+
+  it('enrages below half health', () => {
+    const b = new Zombie(BOSS, 5, 5);
+    expect(b.enraged).toBe(false);
+    b.hurt(BOSS.hp * 0.55, 0, 1, 0);
+    expect(b.enraged).toBe(true);
+  });
+
+  it('picking up the SMG equips it with a full magazine and adds it to the weapon cycle', () => {
+    const w = new World();
+    for (const z of w.zombies) { z.x = 1.5; z.y = 1.5; z.hp = 1e9; }
+    const s = ITEM_SPAWNS.find((i) => i.kind === ItemKind.Smg)!;
+    w.player.x = s.x;
+    w.player.y = s.y;
+    w.update(idle, 1 / 60);
+    expect(w.inventory.has(InvItem.Smg)).toBe(true);
+    expect(w.weapons.smg.mag).toBe(SMG.magSize);
+    expect(w.switchTo('smg')).toBe(true);
+    w.switchLock = 0;
+    expect(w.cycleWeapon()).toBe(true);
+    expect(w.equipped).toBe('pistol');
+  });
+
+  it('arena crates give much more ammo than the house ones', () => {
+    const w = new World();
+    for (const z of w.zombies) { z.x = 1.5; z.y = 1.5; z.hp = 1e9; }
+    const before = w.ammo.bullets;
+    const c = ITEM_SPAWNS.find((i) => i.kind === ItemKind.BulletCrate)!;
+    w.player.x = c.x;
+    w.player.y = c.y;
+    w.update(idle, 1 / 60);
+    expect(w.ammo.bullets).toBe(before + CRATE_BULLETS);
+  });
+
+  it('the SMG, held down, defeats a stationary boss in a few seconds', () => {
+    const w = new World();
+    for (const z of w.zombies) { z.x = 1.5; z.y = 1.5; z.hp = 1e9; }
+    w.inventory.add(InvItem.Smg);
+    w.weapons.smg.mag = SMG.magSize;
+    w.ammo.bullets = 400;
+    w.equipped = 'smg';
+    w.aimAssist = 0.035;
+    const b = new Zombie({ ...BOSS, speed: 0 }, 9.5, 28.5);
+    w.zombies.push(b);
+    w.boss = b;
+    w.player.x = 9.5;
+    w.player.y = 24.5;
+    w.player.angle = Math.PI / 2;
+    let t = 0;
+    while (!b.dead && t < 40 && !w.dead) {
+      w.fire();
+      w.update(idle, 1 / 60);
+      t += 1 / 60;
+    }
+    expect(b.dead).toBe(true);
+    expect(t).toBeGreaterThan(5);
+    expect(w.bossDefeated).toBe(true);
+    expect(MAX_HP).toBe(100);
+  });
+});

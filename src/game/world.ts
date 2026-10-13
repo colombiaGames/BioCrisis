@@ -1,0 +1,334 @@
+import { CELL_EXIT, GridMap } from '../engine/raycast';
+import { SpriteBatch } from '../engine/sprites';
+import { Doors } from './doors';
+import { ITEM_DEFS, Item, PICKUP_RADIUS, WEAPON_ITEM, WEAPON_MISSING } from './items';
+import { INVENTORY_SLOTS, InvItem, Inventory } from './inventory';
+import { BOSS_SPAWN, DECOR_SPAWNS, FINAL_EXIT, ITEM_SPAWNS, ItemKind, START, ZOMBIE_SPAWNS, createHouse } from './map';
+import { Pathfinder } from './pathfinding';
+import { MoveInput, Player } from './player';
+import { Rng } from '../engine/rng';
+import { resolveShot } from './shot';
+import { AmmoPool, PISTOL, SHOTGUN, SMG, Weapon, WeaponId, spreadAngles } from './weapons';
+import { BOSS, RUNNER, WALKER, ZContext, Zombie } from './zombie';
+
+const MESSAGE_SECONDS = 2.5;
+export const MAX_HP = 100;
+export const TONIC_HEAL = 35;
+export const HEAL_TIME = 0.8;
+export const SWITCH_LOCK = 0.4;
+export const ALARM_RADIUS = 40;
+export const AIM_ASSIST = 0.035;
+export const START_RESERVE = 6;
+const WEAPON_ORDER: readonly WeaponId[] = ['pistol', 'shotgun', 'smg'];
+
+export type WorldEvent =
+  | 'shot'
+  | 'alarm'
+  | 'shotgunShot'
+  | 'shell'
+  | 'dry'
+  | 'switch'
+  | 'keyPickup'
+  | 'doorClose'
+  | 'doorLocked'
+  | 'healStart'
+  | 'heal'
+  | 'reloadStart'
+  | 'reloaded'
+  | 'zombieHit'
+  | 'zombieKill'
+  | 'playerHurt'
+  | 'playerDead'
+  | 'pickup'
+  | 'bossWake'
+  | 'bossDead'
+  | 'doorOpen';
+
+export class World {
+  readonly map: GridMap = createHouse();
+  readonly doors = new Doors(this.map);
+  readonly player = new Player(START.x, START.y, START.angle);
+  readonly items: Item[] = ITEM_SPAWNS.map((s) => ({ ...s, taken: false }));
+
+  readonly pathfinder = new Pathfinder(this.map.width, this.map.height);
+  readonly zombies: Zombie[] = ZOMBIE_SPAWNS.map((s) => new Zombie(s.type === 'walker' ? WALKER : RUNNER, s.x, s.y));
+  readonly inventory = new Inventory(INVENTORY_SLOTS);
+  readonly weapons: Record<WeaponId, Weapon> = { pistol: new Weapon(PISTOL), shotgun: new Weapon(SHOTGUN, 0), smg: new Weapon(SMG, 0) };
+  readonly ammo: AmmoPool = { bullets: START_RESERVE, shells: 0 };
+  readonly stats = { shots: 0, hits: 0, kills: 0, tonicsUsed: 0 };
+  boss: Zombie | null = null;
+  bossDefeated = false;
+  aimAssist = AIM_ASSIST;
+  onEvent: ((e: WorldEvent, x?: number, y?: number) => void) | null = null;
+
+  private emit(e: WorldEvent, x?: number, y?: number): void {
+    this.onEvent?.(e, x, y);
+  }
+
+  equipped: WeaponId = 'pistol';
+  switchLock = 0;
+  healTimer = 0;
+  hp = MAX_HP;
+  dead = false;
+  hurtFlash = 0;
+  private readonly rng: Rng;
+  private readonly spread = new Float64Array(16);
+
+  constructor(seed = 20240601) {
+    this.rng = new Rng(seed);
+    this.inventory.add(InvItem.Pistol);
+    this.doors.onUse = (d, r) => {
+      const ev = r === 'opened' ? 'doorOpen' : r === 'closed' ? 'doorClose' : r === 'locked' ? 'doorLocked' : null;
+      if (ev) this.emit(ev, d.x + 0.5, d.y + 0.5);
+      if (d.boss && r === 'opened') this.startBossFight();
+    };
+  }
+
+  private readonly rand = (): number => this.rng.next();
+
+  get weapon(): Weapon {
+    return this.weapons[this.equipped];
+  }
+  get hasKey(): boolean {
+    return this.inventory.has(InvItem.Key);
+  }
+  get hasShotgun(): boolean {
+    return this.inventory.has(InvItem.Shotgun);
+  }
+  get tonics(): number {
+    return this.inventory.count(InvItem.Tonic);
+  }
+
+  private readonly zctx: ZContext = {
+    map: this.map,
+    doors: this.doors,
+    pathfinder: this.pathfinder,
+    px: 0,
+    py: 0,
+    others: this.zombies,
+    damagePlayer: (n) => this.hurtPlayer(n),
+  };
+
+  alarm = false;
+  won = false;
+  time = 0;
+  message = '';
+  messageTime = 0;
+
+  update(input: MoveInput, dt: number): void {
+    if (this.won || this.dead) return;
+    this.time += dt;
+    if (this.messageTime > 0) this.messageTime -= dt;
+    if (this.hurtFlash > 0) this.hurtFlash = Math.max(0, this.hurtFlash - dt * 1.5);
+    this.player.update(this.map, input, dt, this.zombies);
+    this.doors.update(dt);
+    if (this.switchLock > 0) this.switchLock = Math.max(0, this.switchLock - dt);
+    const wev = this.weapon.update(dt, this.ammo);
+    if (wev === 'reloaded' || wev === 'shell') this.emit(wev);
+    if (this.healTimer > 0) {
+      this.healTimer -= dt;
+      if (this.healTimer <= 0) {
+        this.healTimer = 0;
+        this.applyTonic();
+      }
+    }
+    this.zctx.px = this.player.x;
+    this.zctx.py = this.player.y;
+    for (const z of this.zombies) z.update(this.zctx, dt);
+    if (this.boss?.dead && !this.bossDefeated) this.defeatBoss();
+    this.pickUp();
+    if (this.map.cells[Math.floor(this.player.y) * this.map.width + Math.floor(this.player.x)] === CELL_EXIT) this.won = true;
+  }
+
+  private startBossFight(): void {
+    if (this.boss) return;
+    const b = new Zombie(BOSS, BOSS_SPAWN.x, BOSS_SPAWN.y);
+    this.boss = b;
+    this.zombies.push(b);
+    b.hear(this.player.x, this.player.y);
+    this.say('Something huge awakens...');
+    this.emit('bossWake', b.x, b.y);
+  }
+
+  private defeatBoss(): void {
+    this.bossDefeated = true;
+    this.doors.unlock(FINAL_EXIT.x, FINAL_EXIT.y);
+    this.say('The monster falls. The exit is open');
+    this.emit('bossDead', this.boss!.x, this.boss!.y);
+  }
+
+  private handsBusy(): boolean {
+    return this.won || this.dead || this.healTimer > 0;
+  }
+
+  fire(): void {
+    if (this.handsBusy() || this.switchLock > 0) return;
+    const w = this.weapon;
+    const ev = w.fire();
+    if (ev === 'dry') {
+      this.emit('dry');
+      this.reload();
+      return;
+    }
+    if (ev !== 'fired') return;
+    const def = w.def;
+    this.stats.shots++;
+    this.emit(def.pellets > 1 ? 'shotgunShot' : 'shot');
+    const p = this.player;
+    this.makeNoise(p.x, p.y, def.noise);
+
+    const offsets = spreadAngles(def.pellets, def.spread, this.rand, this.spread);
+    const { hit, kills } = resolveShot(this.map, this.zombies, p, def, this.aimAssist, offsets);
+    this.stats.kills += kills;
+    if (hit) {
+      this.stats.hits++;
+      this.emit(kills > 0 ? 'zombieKill' : 'zombieHit', hit.x, hit.y);
+    }
+  }
+
+  reload(): void {
+    if (this.handsBusy()) return;
+    if (this.weapon.startReload(this.ammo) === 'reloadStart') this.emit('reloadStart');
+  }
+
+  switchTo(id: WeaponId): boolean {
+    if (this.handsBusy() || id === this.equipped) return false;
+    if (!this.owns(id)) {
+      this.say(WEAPON_MISSING[id]);
+      return false;
+    }
+    this.weapon.cancelReload();
+    this.equipped = id;
+    this.switchLock = SWITCH_LOCK;
+    this.emit('switch');
+    return true;
+  }
+
+  cycleWeapon(): boolean {
+    const n = WEAPON_ORDER.length;
+    const from = WEAPON_ORDER.indexOf(this.equipped);
+    for (let i = 1; i < n; i++) {
+      const id = WEAPON_ORDER[(from + i) % n];
+      if (this.owns(id)) return this.switchTo(id);
+    }
+    return false;
+  }
+
+  owns(id: WeaponId): boolean {
+    return this.inventory.has(WEAPON_ITEM[id]);
+  }
+
+  useTonic(instant = false): 'started' | 'healed' | 'full' | 'none' | 'busy' {
+    if (this.dead || this.won) return 'busy';
+    if (this.healTimer > 0) return 'busy';
+    if (this.tonics === 0) {
+      this.say('You have no tonics');
+      return 'none';
+    }
+    if (this.hp >= MAX_HP) {
+      this.say('Health full');
+      return 'full';
+    }
+    if (instant) {
+      this.applyTonic();
+      return 'healed';
+    }
+    this.weapon.cancelReload();
+    this.healTimer = HEAL_TIME;
+    this.emit('healStart');
+    return 'started';
+  }
+
+  private applyTonic(): void {
+    if (this.dead || !this.inventory.removeOne(InvItem.Tonic)) return;
+    this.hp = Math.min(MAX_HP, this.hp + TONIC_HEAL);
+    this.stats.tonicsUsed++;
+    this.say('You feel better');
+    this.emit('heal');
+  }
+
+  get healthLabel(): 'Good' | 'Caution' | 'Danger' {
+    return this.hp > 60 ? 'Good' : this.hp > 30 ? 'Caution' : 'Danger';
+  }
+
+  makeNoise(x: number, y: number, radius: number): void {
+    for (const z of this.zombies) {
+      if (z.dead) continue;
+      if (Math.hypot(z.x - x, z.y - y) <= radius) z.hear(x, y);
+    }
+  }
+
+  hurtPlayer(amount: number): void {
+    if (this.dead) return;
+    this.hp = Math.max(0, this.hp - amount);
+    this.hurtFlash = 1;
+    this.emit('playerHurt');
+    if (this.hp <= 0) {
+      this.dead = true;
+      this.emit('playerDead');
+    }
+  }
+
+  say(text: string): void {
+    this.message = text;
+    this.messageTime = MESSAGE_SECONDS;
+  }
+
+  private pickUp(): void {
+    const p = this.player;
+    for (const it of this.items) {
+      if (it.taken) continue;
+      const dx = it.x - p.x;
+      const dy = it.y - p.y;
+      if (dx * dx + dy * dy > PICKUP_RADIUS * PICKUP_RADIUS) continue;
+      const def = ITEM_DEFS[it.kind];
+      if (def.slot !== undefined && !this.inventory.add(def.slot)) {
+        if (this.messageTime <= 0) this.say('Inventory full');
+        continue;
+      }
+      it.taken = true;
+      this.ammo.bullets += def.bullets ?? 0;
+      this.ammo.shells += def.shells ?? 0;
+      if (def.mag) this.weapons[def.mag.weapon].mag = def.mag.rounds;
+      this.say(def.message);
+      this.emit(it.kind === ItemKind.Key ? 'keyPickup' : 'pickup');
+      if (it.kind === ItemKind.Key) {
+        this.makeNoise(p.x, p.y, ALARM_RADIUS);
+        this.alarm = true;
+        this.emit('alarm');
+      }
+    }
+  }
+
+  interact(): void {
+    const p = this.player;
+    const d = this.doors.ahead(p.x, p.y, Math.cos(p.angle), Math.sin(p.angle));
+    if (!d) return;
+    const cx = Math.floor(p.x);
+    const cy = Math.floor(p.y);
+    if (d.locked) {
+      if (d.boss && this.hasKey) {
+        this.doors.unlock(d.x, d.y);
+        this.say('The key turns. Something breathes on the other side...');
+      } else if (d.exit) {
+        this.say('The exit is sealed');
+        return;
+      } else {
+        this.say('You need a key');
+        return;
+      }
+    }
+    this.doors.use(d.x, d.y, (x, y) => x === cx && y === cy);
+  }
+
+  fillSprites(batch: SpriteBatch): void {
+    batch.clear();
+    for (const d of DECOR_SPAWNS) batch.add(d.x, d.y, d.tex, d.scale, 0);
+    const bob = 0.04 + Math.sin(this.time * 3) * 0.015;
+    for (const it of this.items) {
+      if (!it.taken) batch.add(it.x, it.y, ITEM_DEFS[it.kind].sprite, ITEM_DEFS[it.kind].scale, bob);
+    }
+    for (const z of this.zombies) batch.add(z.x, z.y, z.sprite(), z.def.scale, 0);
+  }
+}
+
